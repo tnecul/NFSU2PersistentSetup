@@ -11,7 +11,11 @@
 //             this+0x348+mode*0x29  -> dstCar+0x398 (41 bytes)
 //   0x850078  app mode global (1 = career gameplay, 2 = main menu/quick race,
 //             4 = 2P, 8/0x100 = online, 0x200 = special)
-//   0x863480  active car id (stable per car across launches, verified runtime)
+//   0x863480  career-slot key = hash("CAREER_SLOT_<slot>") (NOT a car id;
+//             every car in a save shares it).  Verified runtime: it is the
+//             dword at 0x85AD40+0x8740, written by FUN_00541540.
+//   0x83A9E0  active profile name (career data object at 0x83A9D0 + 0x10).
+//             Per-save identity used to bind persisted setups.
 //   0x83A63C  setup slot selector (0xFF = no dyno editing session open)
 //
 // Runtime-only install: patches prologs with JMP into naked stubs in hooks.S
@@ -40,8 +44,12 @@ extern "C" {
 static const uint32_t OFF_SAVE_FN   = 0x0010FC20; // 0x50FC20 - 0x400000
 static const uint32_t OFF_ENTRY_FN  = 0x00116AC0; // 0x516AC0 - 0x400000
 static const uint32_t OFF_GAME_MODE = 0x00450078; // 0x850078
-static const uint32_t OFF_CAR_ID    = 0x00463480; // 0x863480
+static const uint32_t OFF_CAR_ID    = 0x00463480; // 0x863480 (career-slot key)
 static const uint32_t OFF_SLOT_SEL  = 0x0043A63C; // 0x83A63C
+// Active career profile name: first field of the career data object at
+// 0x83A9D0+0x10. Inline NUL-terminated ASCII, e.g. "Tnecul". Verified live
+// against SPEED2.EXE with two profiles (changes with the loaded profile).
+static const uint32_t OFF_PROFILE_NAME = 0x0043A9E0; // 0x83A9E0 - 0x400000
 
 static uintptr_t g_base      = 0;
 static bool      g_careerOnly = true;
@@ -69,6 +77,58 @@ static inline bool DynoInactive() {
     return *(volatile uint32_t*)(g_base + OFF_SLOT_SEL) == 0xFF;
 }
 
+// ---------------------------------------------------------------------------
+// Save identity.
+//
+// OFF_CAR_ID is the career-slot key (hash of "CAREER_SLOT_<slot>") stored in
+// the garage object, NOT a car id: every car in a save shares it, and two
+// different careers can occupy the same slot. Persisting on that key alone
+// leaks a setup from one career into a newly created career (the reported
+// crash when buying a car). The active profile name is the game's own
+// per-save identity, so entries are keyed by (career key, profile hash).
+// ---------------------------------------------------------------------------
+static inline uint32_t HashName(const char* s) {
+    // Replicates the game's bStringHash used for "CAREER_SLOT_%d" etc.
+    int32_t h = -1;
+    for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+        uint32_t c = *p;
+        if (c > 0x60 && c < 0x7B) c -= 0x20;   // toupper(a-z)
+        h = (int32_t)((uint32_t)h * 0x21u + c);
+    }
+    return (uint32_t)h;
+}
+
+// Copies the active profile name. Rejects empty/non-printable/overlong data so
+// the plugin never binds to a half-initialised career buffer (e.g. main menu).
+static bool ReadProfileName(char* out, size_t cap) {
+    if (out == nullptr || cap < 2) return false;
+    out[0] = '\0';
+    if (!g_base) return false;
+
+    const volatile char* src = (const volatile char*)(g_base + OFF_PROFILE_NAME);
+    size_t n = 0;
+    for (; n + 1 < cap && n < 63; ++n) {
+        char c = src[n];
+        if (c == '\0') break;
+        if ((unsigned char)c < 0x20 || (unsigned char)c >= 0x7F) return false;
+        out[n] = c;
+    }
+    out[n] = '\0';
+    if (n == 0) return false;
+    if (src[n] != '\0') return false;          // not terminated within the cap
+    return true;
+}
+
+// Returns 0 when no profile is loaded; callers must then do nothing.
+static uint32_t ReadSaveId(char* nameOut, size_t cap) {
+    if (!ReadProfileName(nameOut, cap)) return 0;
+    return HashName(nameOut);
+}
+
+static inline uint64_t MakeEntryKey(uint32_t carKey, uint32_t saveId) {
+    return ((uint64_t)carKey << 32) | (uint64_t)saveId;
+}
+
 static void DebugLogLine(const char* fmt, ...) {
     if (!g_debugLog || !g_logPath[0]) return;
     FILE* f = fopen(g_logPath, "a");
@@ -93,8 +153,13 @@ static void DebugLogLine(const char* fmt, ...) {
 //   CareerOnly=1
 //   DebugLog=0
 //
-//   [Car_319A8CA1]
+//   [Car_<careerkey>_<savehash>]
+//   Profile=<active profile name, informational>
 //   Payload=<82 hex chars, 41 bytes>
+//
+// Legacy [Car_<careerkey>] sections are deliberately ignored: they are not
+// bound to a save and are what made a new career inherit an old career's
+// setup (and crash on a freshly bought car).
 // ---------------------------------------------------------------------------
 static const size_t kPayloadSize = 41;
 
@@ -103,8 +168,28 @@ struct SetupEntry {
     uint8_t data[kPayloadSize];
 };
 
-static std::map<uint32_t, SetupEntry> g_cache;
+static std::map<uint64_t, SetupEntry> g_cache;   // key: (carKey, saveId)
 static bool g_cacheLoaded = false;
+
+// Section name is "Car_" + 8 hex + "_" + 8 hex (21 chars). Anything else that
+// starts with "Car_" is a legacy/invalid section.
+static const size_t kBoundSectionLen = 21;
+
+static bool ParseHex8(const char* p, uint32_t* out) {
+    if (!p || lstrlenA(p) < 8) return false;
+    uint32_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        int c = p[i];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        v = (v << 4) | (uint32_t)d;
+    }
+    *out = v;
+    return true;
+}
 
 static void BuildPaths(HMODULE pluginModule) {
     char modulePath[MAX_PATH];
@@ -164,48 +249,69 @@ static void LoadCache() {
 
     const char* p = sectionNames;
     while (*p) {
-        if (!strncmp(p, "Car_", 4) && lstrlenA(p) == 12) {
-            uint32_t carId = (uint32_t)strtoul(p + 4, nullptr, 16);
-            if (carId) {
-                char payloadHex[160] = { 0 };
-                GetPrivateProfileStringA(p, "Payload", "", payloadHex,
-                                         sizeof(payloadHex), g_iniPath);
-                SetupEntry e;
-                e.valid = false;
-                memset(e.data, 0, sizeof(e.data));
-                if (HexDecode(payloadHex, e.data, kPayloadSize)) {
-                    e.valid = true;
-                    g_cache[carId] = e;
-                    DebugLogLine("load: car %08X payload ok", carId);
+        int len = lstrlenA(p);
+        if (!strncmp(p, "Car_", 4) && len == 12) {
+            DebugLogLine("load: legacy section %s ignored (no save binding)", p);
+        }
+        else if (!strncmp(p, "Car_", 4) && len == (int)kBoundSectionLen &&
+                 p[12] == '_') {
+            uint32_t carKey = 0, saveId = 0;
+            if (ParseHex8(p + 4, &carKey) && ParseHex8(p + 13, &saveId) &&
+                carKey && saveId) {
+                char profile[64] = { 0 };
+                GetPrivateProfileStringA(p, "Profile", "", profile,
+                                         sizeof(profile), g_iniPath);
+                if (profile[0] && HashName(profile) != saveId) {
+                    DebugLogLine("load: %s rejected (Profile/hash mismatch)", p);
                 }
                 else {
-                    DebugLogLine("load: car %08X payload rejected (hexlen=%d)",
-                                 carId, lstrlenA(payloadHex));
+                    char payloadHex[160] = { 0 };
+                    GetPrivateProfileStringA(p, "Payload", "", payloadHex,
+                                             sizeof(payloadHex), g_iniPath);
+                    SetupEntry e;
+                    e.valid = false;
+                    memset(e.data, 0, sizeof(e.data));
+                    if (HexDecode(payloadHex, e.data, kPayloadSize)) {
+                        e.valid = true;
+                        g_cache[MakeEntryKey(carKey, saveId)] = e;
+                        DebugLogLine("load: key %08X save %08X (%s) payload ok",
+                                     carKey, saveId, profile[0] ? profile : "?");
+                    }
+                    else {
+                        DebugLogLine("load: key %08X save %08X payload rejected "
+                                     "(hexlen=%d)", carKey, saveId,
+                                     lstrlenA(payloadHex));
+                    }
                 }
             }
         }
-        p += lstrlenA(p) + 1;
+        p += len + 1;
     }
 }
 
 // Cached entry pointer or nullptr; loads the INI lazily on first use.
-static SetupEntry* GetEntry(uint32_t carId) {
+static SetupEntry* GetEntry(uint32_t carKey, uint32_t saveId) {
+    if (!carKey || !saveId) return nullptr;
     if (!g_cacheLoaded) LoadCache();
-    auto it = g_cache.find(carId);
+    auto it = g_cache.find(MakeEntryKey(carKey, saveId));
     if (it == g_cache.end()) return nullptr;
     return it->second.valid ? &it->second : nullptr;
 }
 
-static void SaveEntry(uint32_t carId, const uint8_t* data) {
-    if (!carId) return;
+static void SaveEntry(uint32_t carKey, uint32_t saveId, const char* profile,
+                      const uint8_t* data) {
+    if (!carKey || !saveId) return;
 
     SetupEntry e;
     e.valid = true;
     memcpy(e.data, data, kPayloadSize);
-    g_cache[carId] = e;                 // force hook picks this up immediately
+    g_cache[MakeEntryKey(carKey, saveId)] = e;  // hook picks this up immediately
 
     char section[32];
-    wsprintfA(section, "Car_%08X", carId);
+    wsprintfA(section, "Car_%08X_%08X", carKey, saveId);
+
+    if (profile && profile[0])
+        WritePrivateProfileStringA(section, "Profile", profile, g_iniPath);
 
     char hex[2 * kPayloadSize + 1];
     HexEncode(data, kPayloadSize, hex);
@@ -214,7 +320,9 @@ static void SaveEntry(uint32_t carId, const uint8_t* data) {
     char first[3] = { 0 }, last[3] = { 0 };
     HexEncode(data, 1, first);
     HexEncode(data + kPayloadSize - 1, 1, last);
-    DebugLogLine("save: car %08X committed (first=%s last=%s)", carId, first, last);
+    DebugLogLine("save: key %08X save %08X (%s) committed (first=%s last=%s)",
+                 carKey, saveId, profile && profile[0] ? profile : "?",
+                 first, last);
 }
 
 // ---------------------------------------------------------------------------
@@ -234,11 +342,18 @@ extern "C" __attribute__((fastcall)) void CaptureCommit(void* thiz, void* /*edx*
     uintptr_t editorBuf = *(uintptr_t*)(thizB + 0x900);
     if (!editorBuf) return;                        // mirrors game guard
 
-    uint32_t carId = ReadCarId();
-    if (!carId) { DebugLogLine("save: skipped, no car id"); return; }
+    uint32_t carKey = ReadCarId();
+    if (!carKey) { DebugLogLine("save: skipped, no career key"); return; }
+
+    char profile[64];
+    uint32_t saveId = ReadSaveId(profile, sizeof(profile));
+    if (!saveId) {
+        DebugLogLine("save: skipped, no active profile");
+        return;
+    }
 
     // The 41 bytes being committed live at editorBuf + 0x14 (see FUN_0050FC20).
-    SaveEntry(carId, (const uint8_t*)(editorBuf + 0x14));
+    SaveEntry(carKey, saveId, profile, (const uint8_t*)(editorBuf + 0x14));
 }
 
 // Hook of FUN_00516AC0 (race/dyno entry copy). Runs BEFORE the original:
@@ -254,13 +369,25 @@ extern "C" __attribute__((fastcall)) void PreEntryPatch(void* srcThiz, void* /*e
 
     if (!g_base) return;
 
-    uint32_t carId = ReadCarId();
-    if (!carId) return;
-    DebugLogLine("entry: car %08X mode %d %s", carId, mode,
+    uint32_t carKey = ReadCarId();
+    if (!carKey) return;
+
+    char profile[64];
+    uint32_t saveId = ReadSaveId(profile, sizeof(profile));
+    if (!saveId) {
+        DebugLogLine("entry: skipped, no active profile");
+        return;
+    }
+
+    DebugLogLine("entry: key %08X save %08X (%s) mode %d %s", carKey, saveId,
+                 profile, mode,
                  g_careerOnly && IsCareerGameplay() ? "(career)" : "(non-career)");
 
-    SetupEntry* e = GetEntry(carId);
-    if (!e) { DebugLogLine("entry: no persisted setup, vanilla behavior"); return; }
+    SetupEntry* e = GetEntry(carKey, saveId);
+    if (!e) {
+        DebugLogLine("entry: no persisted setup for this save, vanilla behavior");
+        return;
+    }
 
     unsigned char* srcB = (unsigned char*)srcThiz;
     uint8_t* bank = srcB + 0x348 + (size_t)mode * 0x29;
